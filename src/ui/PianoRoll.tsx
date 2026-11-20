@@ -12,6 +12,8 @@ interface Props {
   grid: number;
   /** Raw pitch contour drawn faintly behind the notes. */
   frames: readonly { t: number; freq: number | null }[];
+  /** Singer's tuning offset (semitones); the contour is shifted by it so it lines up with the rows. */
+  tuningOffset: number;
   selectedId: number | null;
   onSelect(id: number | null): void;
   playhead: () => number | null;
@@ -31,6 +33,7 @@ export function PianoRoll({
   bars,
   grid,
   frames,
+  tuningOffset,
   selectedId,
   onSelect,
   playhead,
@@ -114,7 +117,7 @@ export function PianoRoll({
       continue;
     }
     const x = bx(f.t / beat);
-    const y = ry(freqToMidi(f.freq) + shift) + ROW_H / 2;
+    const y = ry(freqToMidi(f.freq) - tuningOffset + shift) + ROW_H / 2;
     contour += `${f.t - prevT > 0.03 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
     prevT = f.t;
   }

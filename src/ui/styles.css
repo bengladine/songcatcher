@@ -509,5 +509,14 @@ button:disabled {
   min-height: 52px;
   display: flex;
   align-items: center;
-  justify-content: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.pill.tune {
+  margin-left: 0;
+}
+.pill.tune.on {
+  background: var(--on);
+  color: var(--on-text);
+  border-color: var(--on);
 }

@@ -12,6 +12,7 @@ import {
   type Note,
 } from '../music/notes';
 import { segmentNotes, type RawNote } from '../music/segment';
+import { estimateTuningOffset, retune } from '../music/tuning';
 import { beatDuration, type Meter } from '../music/timing';
 import { BeatIndicator, NoteReadout } from './LiveIndicators';
 import { NotesToolbar, type EditAction } from './NotesToolbar';
@@ -42,6 +43,8 @@ export function App() {
   const [notes, setNotes] = useState<readonly Note[]>([]);
   const [edited, setEdited] = useState(false);
   const [octave, setOctave] = useState(0);
+  /** Estimated offset of the singer's tuning from A440, semitones. */
+  const [tuning, setTuning] = useState(0);
   const [selected, setSelected] = useState<number | null>(null);
 
   const originRef = useRef<number | null>(null);
@@ -53,6 +56,10 @@ export function App() {
   const viewBars = recording || !take ? settings.bars : take.bars;
   const grid = GRID[settings.grid];
   const totalBeats = viewBars * BEATS_PER_BAR;
+  const appliedTuning = settings.autoTune ? tuning : 0;
+
+  const buildNotes = (raw: RawNote[], t: Take, gridBeats: number, offset: number) =>
+    quantizeNotes(retune(raw, offset), t.meter, gridBeats, t.bars * BEATS_PER_BAR);
 
   // What the user is hearing right now, on the take timeline.
   const playhead = useCallback(() => {
@@ -105,10 +112,12 @@ export function App() {
       setMode('recording');
       const t = await handle.done;
       const raw = segmentNotes(t.frames);
+      const offset = estimateTuningOffset(raw);
       setTake(t);
       setFrames(t.frames);
       setRawNotes(raw);
-      setNotes(quantizeNotes(raw, t.meter, grid, t.bars * BEATS_PER_BAR));
+      setTuning(offset);
+      setNotes(buildNotes(raw, t, grid, settings.autoTune ? offset : 0));
       setEdited(false);
       setOctave(0);
       setView('notes');
@@ -141,7 +150,18 @@ export function App() {
     if (take && edited && !confirm('Changing the grid re-reads the notes from the recording. Your edits will be lost.')) return;
     update({ grid: g });
     if (take) {
-      setNotes(quantizeNotes(rawNotes, take.meter, GRID[g], take.bars * BEATS_PER_BAR));
+      setNotes(buildNotes(rawNotes, take, GRID[g], appliedTuning));
+      setEdited(false);
+      setSelected(null);
+    }
+  };
+
+  const toggleAutoTune = () => {
+    if (take && edited && !confirm('Re-reading the notes with the other tuning drops your edits.')) return;
+    const on = !settings.autoTune;
+    update({ autoTune: on });
+    if (take) {
+      setNotes(buildNotes(rawNotes, take, grid, on ? tuning : 0));
       setEdited(false);
       setSelected(null);
     }
@@ -207,6 +227,7 @@ export function App() {
             bars={viewBars}
             grid={grid}
             frames={frames}
+            tuningOffset={appliedTuning}
             selectedId={selected}
             onSelect={setSelected}
             playhead={playhead}
@@ -218,6 +239,9 @@ export function App() {
             octave={octave}
             onOctave={setOctave}
             onFit={() => setOctave(fitOctave(notes))}
+            autoTune={settings.autoTune}
+            tuningCents={Math.round(tuning * 100)}
+            onToggleAutoTune={toggleAutoTune}
             hasSelection={selected !== null}
             onEdit={edit}
             disabled={busy}

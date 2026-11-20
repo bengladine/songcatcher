@@ -6,6 +6,9 @@ interface Props {
   octave: number;
   onOctave(o: number): void;
   onFit(): void;
+  autoTune: boolean;
+  tuningCents: number;
+  onToggleAutoTune(): void;
   hasSelection: boolean;
   onEdit(action: EditAction): void;
   disabled: boolean;
@@ -72,7 +75,19 @@ export function NotesToolbar(p: Props) {
           ))}
         </div>
       ) : (
-        <p className="hint edit-hint">Tap a note to edit it.</p>
+        <div className="edit-hint">
+          <span className="hint">Tap a note to edit it.</span>
+          <button
+            className={`pill tune ${p.autoTune ? 'on' : ''}`}
+            disabled={p.disabled}
+            onClick={p.onToggleAutoTune}
+            aria-pressed={p.autoTune}
+            title="Round notes to your own tuning instead of A440"
+          >
+            {p.autoTune ? '✓ ' : ''}Match my tuning ({p.tuningCents > 0 ? '+' : ''}
+            {p.tuningCents}¢)
+          </button>
+        </div>
       )}
     </div>
   );

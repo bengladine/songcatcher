@@ -9,6 +9,8 @@ export interface Settings {
   /** Manual latency correction, ms (added to the auto estimate). */
   latencyAdjustMs: number;
   grid: GridName;
+  /** Round notes relative to the singer's own tuning rather than A440. */
+  autoTune: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -18,6 +20,7 @@ export const DEFAULT_SETTINGS: Settings = {
   clickVolume: 0.6,
   latencyAdjustMs: 0,
   grid: '1/8',
+  autoTune: true,
 };
 
 const KEY = 'songcatcher.settings.v1';
