@@ -149,3 +149,36 @@ describe('segmentNotes with a real voice', () => {
     expect(notes.map((n) => n.pitch)).toEqual([52, 52]);
   });
 });
+
+describe('segmentNotes in speaker mode (screenshot: F#3 F#3 split on the beat)', () => {
+  /** Held note; a click is gated at `clickAt` and echo cancellation ducks the voice right after. */
+  function heldWithClick(clickAt: number, duckDb: number) {
+    const frames = contour(
+      0.9,
+      (t) => 54 + jitter(t) * 0.6,
+      (t) => (t > clickAt + 0.07 && t < clickAt + 0.11 ? 0.3 * 10 ** (-duckDb / 20) : 0.3),
+    );
+    for (const f of frames) if (f.t >= clickAt - 0.03 && f.t < clickAt + 0.08) Object.assign(f, { freq: null, gated: true });
+    return frames;
+  }
+
+  it('ignores echo-cancellation ducking right after a click', () => {
+    expect(segmentNotes(heldWithClick(0.4, 18)).map((n) => n.pitch)).toEqual([54]);
+  });
+
+  it('keeps a note whole when it only gets quieter', () => {
+    const notes = segmentNotes(contour(0.8, () => 54, (t) => (t > 0.38 && t < 0.42 ? 0.3 * 10 ** (-8 / 20) : 0.3)));
+    expect(notes).toHaveLength(1);
+  });
+
+  it('merges a slide into a note across a gated click gap', () => {
+    const frames = contour(0.7, (t) => (t < 0.1 ? 53 : 52) + jitter(t) * 0.3);
+    for (const f of frames) if (f.t >= 0.1 && f.t < 0.2) Object.assign(f, { freq: null, gated: true });
+    expect(segmentNotes(frames).map((n) => n.pitch)).toEqual([52]);
+  });
+
+  it('still splits at a real gap', () => {
+    const notes = segmentNotes(contour(0.8, (t) => (t > 0.35 && t < 0.45 ? null : 54)));
+    expect(notes).toHaveLength(2);
+  });
+});

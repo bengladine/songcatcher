@@ -37,8 +37,18 @@ export interface SegmentOptions {
   maxGap: number;
   /** Gated (click) gaps up to this long are bridged: we simply don't know what happened there. */
   maxGatedGap: number;
-  /** An RMS dip at least this deep (dB) inside a voiced run = re-articulation of the same pitch. */
+  /**
+   * An RMS dip at least this deep (dB) inside a voiced run = the same pitch sung again.
+   * Deliberately deep (≈ near-silence): a held note that merely gets quieter stays one note.
+   */
   onsetDb: number;
+  /**
+   * Around a metronome click the level isn't trustworthy (phone echo cancellation ducks the
+   * voice while the click plays), so level dips this long before/after a gated window are
+   * ignored.
+   */
+  clickDuckBefore: number;
+  clickDuckAfter: number;
   /** Frames quieter than (take peak − silenceDb) count as silence. */
   silenceDb: number;
   /** Median filter length (frames, odd) applied to the pitch contour. */
@@ -53,7 +63,9 @@ export const DEFAULT_SEGMENT_OPTIONS: SegmentOptions = {
   splitHold: 0.06,
   maxGap: 0.04,
   maxGatedGap: 0.16,
-  onsetDb: 6,
+  onsetDb: 12,
+  clickDuckBefore: 0.03,
+  clickDuckAfter: 0.12,
   silenceDb: 35,
   medianFrames: 5,
 };
@@ -156,7 +168,8 @@ export function segmentNotes(
   const valleyWin = 3;
   const peakWin = Math.max(4, Math.round(0.1 / hop));
   const minFrames = Math.max(1, Math.round(o.minNoteDuration / hop));
-  const usableDb = (i: number) => (frames[i].gated ? NaN : db[i]);
+  const nearClick = markNearGated(frames, o.clickDuckBefore, o.clickDuckAfter);
+  const usableDb = (i: number) => (nearClick[i] ? NaN : db[i]);
 
   for (const s of segs) {
     const cuts = [s.i0];
@@ -189,10 +202,21 @@ export function segmentNotes(
       if (!ps.length) continue;
       const start = frames[a].t;
       const end = frames[b].t + hop;
-      out.push({ rawPitch: median(ps), start, end, onset });
+      let voiced = 0;
+      for (let i = a; i <= b; i++) if (midi[i] !== null) voiced += hop;
+      out.push({ rawPitch: median(ps), start, end, onset, voiced });
     }
   }
-  return tidyNotes(out, hop, o).map(({ rawPitch, start, end }) => ({
+  // Two pieces "touch" if the gap between them is short, or consists only of click-gated
+  // windows (we can't hear what happened there, so assume the voice carried on).
+  const bridgeable = (t0: number, t1: number) => {
+    if (t1 - t0 <= o.maxGap + 1.5 * hop) return true;
+    if (t1 - t0 > o.maxGatedGap + 1.5 * hop) return false;
+    let ungated = 0;
+    for (const f of frames) if (f.t >= t0 && f.t < t1 && !f.gated) ungated += hop;
+    return ungated <= o.maxGap;
+  };
+  return tidyNotes(out, bridgeable, o).map(({ rawPitch, start, end }) => ({
     pitch: Math.round(rawPitch),
     rawPitch,
     start,
@@ -207,6 +231,8 @@ interface Piece {
   start: number;
   end: number;
   onset: Onset;
+  /** Seconds actually heard (excludes click gaps / dropouts inside the span). */
+  voiced: number;
 }
 
 /**
@@ -218,10 +244,14 @@ interface Piece {
  *    (re-attacks after an energy dip or silence stay separate: those are re-sung notes);
  *  - anything still shorter than minNoteDuration is dropped.
  */
-function tidyNotes(pieces: Piece[], hop: number, o: SegmentOptions): Piece[] {
+function tidyNotes(
+  pieces: Piece[],
+  bridgeable: (t0: number, t1: number) => boolean,
+  o: SegmentOptions,
+): Piece[] {
   const ps = pieces.map((p) => ({ ...p }));
-  const dur = (p: Piece) => p.end - p.start;
-  const touching = (a: Piece, b: Piece) => b.start - a.end <= o.maxGap + 1.5 * hop;
+  const dur = (p: Piece) => p.voiced;
+  const touching = (a: Piece, b: Piece) => bridgeable(a.end, b.start);
   const near = (a: Piece, b: Piece) => Math.abs(a.rawPitch - b.rawPitch) <= o.maxGlide;
 
   let changed = true;
@@ -238,8 +268,10 @@ function tidyNotes(pieces: Piece[], hop: number, o: SegmentOptions): Piece[] {
       if (next && next.onset !== 'energy' && touching(p, next) && near(p, next) && dur(next) >= dur(p)) {
         next.start = p.start;
         next.onset = p.onset;
+        next.voiced += p.voiced;
       } else if (prev && p.onset !== 'energy' && touching(prev, p) && near(prev, p) && dur(prev) >= dur(p)) {
         prev.end = p.end;
+        prev.voiced += p.voiced;
       } else continue;
       ps.splice(i, 1);
       changed = true;
@@ -249,16 +281,30 @@ function tidyNotes(pieces: Piece[], hop: number, o: SegmentOptions): Piece[] {
     for (let i = 0; i + 1 < ps.length; i++) {
       const a = ps[i];
       const b = ps[i + 1];
-      if (b.onset === 'pitch' && touching(a, b) && Math.abs(a.rawPitch - b.rawPitch) < 0.5) {
+      // Same pitch, no real silence in between → it was one held note.
+      if (b.onset !== 'energy' && touching(a, b) && Math.abs(a.rawPitch - b.rawPitch) < 0.5) {
         a.rawPitch = (a.rawPitch * dur(a) + b.rawPitch * dur(b)) / (dur(a) + dur(b));
         a.end = b.end;
+        a.voiced += b.voiced;
         ps.splice(i + 1, 1);
         changed = true;
         break;
       }
     }
   }
-  return ps.filter((p) => dur(p) >= o.minNoteDuration);
+  return ps.filter((p) => p.end - p.start >= o.minNoteDuration && p.voiced >= o.minNoteDuration * 0.6);
+}
+
+function markNearGated(frames: readonly TrackFrame[], before: number, after: number): boolean[] {
+  const mark = frames.map(() => false);
+  let j = 0;
+  for (let i = 0; i < frames.length; i++) {
+    if (!frames[i].gated) continue;
+    const t = frames[i].t;
+    while (j < frames.length && frames[j].t < t - before) j++;
+    for (let k = j; k < frames.length && frames[k].t <= t + after; k++) mark[k] = true;
+  }
+  return mark;
 }
 
 function maxOf(f: (i: number) => number, a: number, b: number): number {
