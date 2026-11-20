@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import type { GridName } from '../music/notes';
 
 export interface Settings {
   bpm: number;
@@ -7,6 +8,7 @@ export interface Settings {
   clickVolume: number;
   /** Manual latency correction, ms (added to the auto estimate). */
   latencyAdjustMs: number;
+  grid: GridName;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -15,6 +17,7 @@ export const DEFAULT_SETTINGS: Settings = {
   headphones: true,
   clickVolume: 0.6,
   latencyAdjustMs: 0,
+  grid: '1/8',
 };
 
 const KEY = 'songcatcher.settings.v1';

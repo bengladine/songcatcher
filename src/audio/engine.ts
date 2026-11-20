@@ -1,5 +1,6 @@
 import captureWorkletUrl from './capture-processor.ts?worker&url';
 import { scheduleClicks } from './metronome';
+import { scheduleSynthNotes, type SynthNote } from './synth';
 import { McLeodDetector } from './pitch/McLeodDetector';
 import type { PitchDetector } from './pitch/PitchDetector';
 import { PitchTracker } from './pitch/PitchTracker';
@@ -210,7 +211,7 @@ export class AudioEngine {
   }
 
   /** Play a take's raw audio back with the metronome, aligned as recorded. */
-  async playTake(take: Take, clickVolume: number): Promise<{ origin: number; stop(): void; ended: Promise<void> }> {
+  async playTake(take: Take, clickVolume: number): Promise<Playback> {
     const ctx = await this.context();
     const buf = ctx.createBuffer(1, Math.max(1, take.audio.length), take.sampleRate);
     buf.copyToChannel(take.audio as Float32Array<ArrayBuffer>, 0);
@@ -236,6 +237,57 @@ export class AudioEngine {
       },
     };
   }
+
+  /** Play synth notes (times in seconds from take time 0) over the metronome. */
+  async playNotes(
+    notes: readonly SynthNote[],
+    meter: Meter,
+    bars: number,
+    clickVolume: number,
+  ): Promise<Playback> {
+    const ctx = await this.context();
+    const origin = ctx.currentTime + 0.1;
+    const stopNotes = scheduleSynthNotes(ctx, ctx.destination, notes, origin);
+    const stopClicks = scheduleClicks(ctx, ctx.destination, clickSchedule(meter, 0, bars), origin, clickVolume);
+    const timer = endAt(ctx, origin + bars * barDuration(meter) + 0.1);
+    return {
+      origin,
+      ended: timer.ended,
+      stop: () => {
+        stopNotes();
+        stopClicks();
+        timer.cancel();
+      },
+    };
+  }
+}
+
+export interface Playback {
+  /** AudioContext time of take time 0. */
+  origin: number;
+  ended: Promise<void>;
+  stop(): void;
+}
+
+/** Resolves when the context clock passes `time` (or the playback is stopped). */
+function endAt(ctx: AudioContext, time: number): { ended: Promise<void>; cancel: () => void } {
+  // A silent source whose onended fires on the audio clock: no drift vs. setTimeout.
+  const src = ctx.createConstantSource();
+  src.offset.value = 0;
+  src.connect(ctx.destination);
+  const ended = new Promise<void>((r) => (src.onended = () => (src.disconnect(), r())));
+  src.start();
+  src.stop(time);
+  return {
+    ended,
+    cancel: () => {
+      try {
+        src.stop();
+      } catch {
+        /* already stopped */
+      }
+    },
+  };
 }
 
 function concat(chunks: Float32Array[]): Float32Array {

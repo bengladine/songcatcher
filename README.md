@@ -2,7 +2,9 @@
 
 Hum a riff to a metronome → notes → guitar tab. Mobile-first PWA, no backend.
 
-**Status:** Milestone 1 (capture): metronome with a 1-bar count-in, recording N bars from the mic, live raw pitch line, playback of the take.
+**Status:**
+- Milestone 1 (capture): metronome with a 1-bar count-in, recording N bars from the mic, live raw pitch line, playback of the take.
+- Milestone 2 (notes): pitch track → notes, quantize to 1/8 or 1/16, octave shift and fit-to-guitar, piano roll editing (pitch, timing, length, delete), synth playback with the click.
 
 ## Develop
 
@@ -26,7 +28,8 @@ to `main`. One-time setup: *Settings → Pages → Build and deployment → Sour
 ```
 src/audio   Web Audio: engine (context, mic, recording), metronome, capture worklet,
             pitch/ (PitchDetector interface, McLeod/pitchy backend, PitchTracker framing)
-src/music   Pure music logic: timing grid, click schedule, click gate, pitch ↔ MIDI
+src/music   Pure music logic: timing grid, click schedule, click gate, pitch ↔ MIDI,
+            note segmentation, quantization, note edits, octave fit
 src/ui      React components
 public/     PWA manifest, icons, service worker
 ```
@@ -43,3 +46,7 @@ public/     PWA manifest, icons, service worker
   analysis window that overlaps a click (shown as grey bands).
 - **Pitch:** McLeod pitch method (`pitchy`), 2048-sample window, 512 hop, behind the
   `PitchDetector` interface so pYIN/CREPE can be swapped in later.
+- **Notes:** `segmentNotes` median-filters the contour (kills single-frame octave errors), starts a
+  new note when the pitch moves > 0.6 semitone for ≥ 30 ms, bridges short dropouts and click gaps,
+  splits re-sung same-pitch notes on a ≥ 6 dB level dip, and drops notes shorter than 70 ms.
+  `quantizeNotes` snaps start and end separately and keeps the line monophonic.

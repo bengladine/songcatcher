@@ -1,13 +1,28 @@
 import { useCallback, useMemo, useRef, useState } from 'react';
-import { AudioEngine, type PitchFrame, type Take } from '../audio/engine';
-import type { Meter } from '../music/timing';
+import { AudioEngine, type Playback, type PitchFrame, type Take } from '../audio/engine';
+import {
+  deleteNote,
+  fitOctave,
+  GRID,
+  moveNote,
+  quantizeNotes,
+  resizeNote,
+  transposeNote,
+  type GridName,
+  type Note,
+} from '../music/notes';
+import { segmentNotes, type RawNote } from '../music/segment';
+import { beatDuration, type Meter } from '../music/timing';
 import { BeatIndicator, NoteReadout } from './LiveIndicators';
+import { NotesToolbar, type EditAction } from './NotesToolbar';
+import { PianoRoll } from './PianoRoll';
 import { PitchView } from './PitchView';
+import { SettingsPanel } from './SettingsPanel';
 import { useSettings } from './settings';
 
 type Mode = 'idle' | 'starting' | 'recording' | 'playing';
+type View = 'notes' | 'pitch';
 
-const BAR_OPTIONS = [1, 2, 4, 8];
 const BEATS_PER_BAR = 4; // 4/4 only for now
 const COUNT_IN_BARS = 1;
 
@@ -15,18 +30,29 @@ export function App() {
   const engine = useMemo(() => new AudioEngine(), []);
   const [settings, update] = useSettings();
   const [mode, setMode] = useState<Mode>('idle');
-  const [take, setTake] = useState<Take | null>(null);
+  const [view, setView] = useState<View>('notes');
+  const [settingsOpen, setSettingsOpen] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
 
-  // Live frames are appended in place (no React state) and drawn by rAF.
+  const [take, setTake] = useState<Take | null>(null);
+  // Live frames are appended in place while recording and drawn by rAF.
   const [frames, setFrames] = useState<PitchFrame[]>([]);
+  const [rawNotes, setRawNotes] = useState<RawNote[]>([]);
+  const [notes, setNotes] = useState<readonly Note[]>([]);
+  const [edited, setEdited] = useState(false);
+  const [octave, setOctave] = useState(0);
+  const [selected, setSelected] = useState<number | null>(null);
+
   const originRef = useRef<number | null>(null);
   const stopRef = useRef<(() => void) | null>(null);
 
   const meter: Meter = useMemo(() => ({ bpm: settings.bpm, beatsPerBar: BEATS_PER_BAR }), [settings.bpm]);
-  const viewMeter = take?.meter ?? meter;
-  const viewBars = mode === 'recording' || mode === 'starting' || !take ? settings.bars : take.bars;
+  const recording = mode === 'recording' || mode === 'starting';
+  const viewMeter = (!recording && take?.meter) || meter;
+  const viewBars = recording || !take ? settings.bars : take.bars;
+  const grid = GRID[settings.grid];
+  const totalBeats = viewBars * BEATS_PER_BAR;
 
   // What the user is hearing right now, on the take timeline.
   const playhead = useCallback(() => {
@@ -34,48 +60,10 @@ export function App() {
     return o === null ? null : engine.now - o - engine.outputLatency;
   }, [engine]);
 
-  const record = async () => {
-    setError(null);
-    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-      setError('Microphone needs HTTPS. Open the GitHub Pages URL (or localhost).');
-      return;
-    }
-    const live: PitchFrame[] = [];
-    setFrames(live);
-    setTake(null);
-    setMode('starting');
-    try {
-      const handle = await engine.record({
-        meter: { bpm: settings.bpm, beatsPerBar: BEATS_PER_BAR },
-        bars: settings.bars,
-        countInBars: COUNT_IN_BARS,
-        clickVolume: settings.clickVolume,
-        headphones: settings.headphones,
-        gateClicks: !settings.headphones,
-        latencyAdjust: settings.latencyAdjustMs / 1000,
-        onFrame: (f) => live.push(f),
-      });
-      originRef.current = handle.origin;
-      stopRef.current = handle.stop;
-      setMode('recording');
-      const t = await handle.done;
-      setTake(t);
-      setFrames(t.frames);
-    } catch (e) {
-      setError(describeError(e));
-    } finally {
-      originRef.current = null;
-      stopRef.current = null;
-      setMode('idle');
-      setVersion((v) => v + 1);
-    }
-  };
-
-  const play = async () => {
-    if (!take) return;
+  const runPlayback = async (start: () => Promise<Playback>) => {
     setError(null);
     try {
-      const p = await engine.playTake(take, settings.clickVolume);
+      const p = await start();
       originRef.current = p.origin;
       stopRef.current = p.stop;
       setMode('playing');
@@ -90,9 +78,97 @@ export function App() {
     }
   };
 
+  const record = async () => {
+    setError(null);
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      setError('Microphone needs HTTPS. Open the GitHub Pages URL (or localhost).');
+      return;
+    }
+    const live: PitchFrame[] = [];
+    setFrames(live);
+    setSelected(null);
+    setView('pitch');
+    setMode('starting');
+    try {
+      const handle = await engine.record({
+        meter,
+        bars: settings.bars,
+        countInBars: COUNT_IN_BARS,
+        clickVolume: settings.clickVolume,
+        headphones: settings.headphones,
+        gateClicks: !settings.headphones,
+        latencyAdjust: settings.latencyAdjustMs / 1000,
+        onFrame: (f) => live.push(f),
+      });
+      originRef.current = handle.origin;
+      stopRef.current = handle.stop;
+      setMode('recording');
+      const t = await handle.done;
+      const raw = segmentNotes(t.frames);
+      setTake(t);
+      setFrames(t.frames);
+      setRawNotes(raw);
+      setNotes(quantizeNotes(raw, t.meter, grid, t.bars * BEATS_PER_BAR));
+      setEdited(false);
+      setOctave(0);
+      setView('notes');
+      setSettingsOpen(false);
+    } catch (e) {
+      setError(describeError(e));
+      if (take) setFrames(take.frames);
+    } finally {
+      originRef.current = null;
+      stopRef.current = null;
+      setMode('idle');
+      setVersion((v) => v + 1);
+    }
+  };
+
+  const play = () => {
+    if (!take) return;
+    if (view === 'pitch') return runPlayback(() => engine.playTake(take, settings.clickVolume));
+    const beat = beatDuration(take.meter);
+    const synth = notes.map((n) => ({
+      pitch: n.pitch + 12 * octave,
+      start: n.start * beat,
+      duration: n.length * beat,
+    }));
+    return runPlayback(() => engine.playNotes(synth, take.meter, take.bars, settings.clickVolume));
+  };
+
+  const changeGrid = (g: GridName) => {
+    if (g === settings.grid) return;
+    if (take && edited && !confirm('Changing the grid re-reads the notes from the recording. Your edits will be lost.')) return;
+    update({ grid: g });
+    if (take) {
+      setNotes(quantizeNotes(rawNotes, take.meter, GRID[g], take.bars * BEATS_PER_BAR));
+      setEdited(false);
+      setSelected(null);
+    }
+  };
+
+  const edit = (action: EditAction) => {
+    if (selected === null) return;
+    let next: readonly Note[] = notes;
+    switch (action) {
+      case 'up': next = transposeNote(notes, selected, 1); break;
+      case 'down': next = transposeNote(notes, selected, -1); break;
+      case 'earlier': next = moveNote(notes, selected, -grid, totalBeats); break;
+      case 'later': next = moveNote(notes, selected, grid, totalBeats); break;
+      case 'shorter': next = resizeNote(notes, selected, -grid, grid, totalBeats); break;
+      case 'longer': next = resizeNote(notes, selected, grid, grid, totalBeats); break;
+      case 'delete': next = deleteNote(notes, selected); setSelected(null); break;
+    }
+    if (next !== notes) {
+      setNotes(next);
+      setEdited(true);
+    }
+  };
+
   const stop = () => stopRef.current?.();
   const busy = mode !== 'idle';
   const live = mode === 'recording' || mode === 'playing';
+  const showNotes = view === 'notes' && !recording && take;
 
   return (
     <div className="app">
@@ -101,124 +177,60 @@ export function App() {
         <NoteReadout frames={frames} live={mode === 'recording'} />
       </header>
 
-      <section className="card controls" aria-disabled={busy}>
-        <div className="row">
-          <span className="label">Tempo</span>
-          <div className="stepper">
-            <button disabled={busy} onClick={() => update({ bpm: clampBpm(settings.bpm - 1) })} aria-label="Slower">
-              −
-            </button>
-            <input
-              type="number"
-              inputMode="numeric"
-              min={30}
-              max={300}
-              value={settings.bpm}
-              disabled={busy}
-              onChange={(e) => {
-                const v = Number(e.target.value);
-                if (Number.isFinite(v) && v > 0) update({ bpm: v });
-              }}
-              onBlur={() => update({ bpm: clampBpm(settings.bpm) })}
-              aria-label="BPM"
-            />
-            <button disabled={busy} onClick={() => update({ bpm: clampBpm(settings.bpm + 1) })} aria-label="Faster">
-              +
-            </button>
-          </div>
-          <span className="unit">BPM · 4/4</span>
-        </div>
-
-        <div className="row">
-          <span className="label">Bars</span>
-          <div className="segmented" role="radiogroup" aria-label="Bars to record">
-            {BAR_OPTIONS.map((n) => (
-              <button
-                key={n}
-                role="radio"
-                aria-checked={settings.bars === n}
-                className={settings.bars === n ? 'on' : ''}
-                disabled={busy}
-                onClick={() => update({ bars: n })}
-              >
-                {n}
-              </button>
-            ))}
-          </div>
-        </div>
-
-        <div className="row">
-          <span className="label">Output</span>
-          <div className="segmented" role="radiogroup" aria-label="Listening with">
-            <button
-              role="radio"
-              aria-checked={settings.headphones}
-              className={settings.headphones ? 'on' : ''}
-              disabled={busy}
-              onClick={() => update({ headphones: true })}
-            >
-              🎧 Headphones
-            </button>
-            <button
-              role="radio"
-              aria-checked={!settings.headphones}
-              className={!settings.headphones ? 'on' : ''}
-              disabled={busy}
-              onClick={() => update({ headphones: false })}
-            >
-              🔊 Speaker
-            </button>
-          </div>
-        </div>
-        <p className="hint">
-          {settings.headphones
-            ? 'Best: the click stays out of the mic.'
-            : 'Pitch right at each click is ignored. Headphones work better.'}
-        </p>
-
-        <details className="advanced">
-          <summary>More</summary>
-          <label className="row">
-            <span className="label">Click</span>
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.05}
-              value={settings.clickVolume}
-              onChange={(e) => update({ clickVolume: Number(e.target.value) })}
-            />
-          </label>
-          <label className="row">
-            <span className="label">Latency</span>
-            <input
-              type="range"
-              min={-100}
-              max={250}
-              step={5}
-              value={settings.latencyAdjustMs}
-              disabled={busy}
-              onChange={(e) => update({ latencyAdjustMs: Number(e.target.value) })}
-            />
-            <span className="unit">{settings.latencyAdjustMs > 0 ? '+' : ''}{settings.latencyAdjustMs} ms</span>
-          </label>
-          <p className="hint">
-            If notes land consistently late on the grid, raise latency; if early, lower it.
-            {take ? ` Last take used ${Math.round(take.latency * 1000)} ms in total.` : ''}
-          </p>
-        </details>
-      </section>
-
-      <BeatIndicator meter={viewMeter} bars={viewBars} playhead={playhead} live={live} />
-
-      <PitchView
-        frames={frames}
-        meter={viewMeter}
-        bars={viewBars}
-        playhead={playhead}
-        live={live}
-        version={version}
+      <SettingsPanel
+        settings={settings}
+        update={update}
+        busy={busy}
+        open={settingsOpen}
+        onToggle={() => setSettingsOpen((o) => !o)}
+        lastLatency={take?.latency ?? null}
       />
+
+      <div className="view-bar">
+        <div className="segmented small tabs" role="tablist">
+          <button role="tab" aria-selected={view === 'notes'} className={view === 'notes' ? 'on' : ''} disabled={busy} onClick={() => setView('notes')}>
+            Notes{take ? ` (${notes.length})` : ''}
+          </button>
+          <button role="tab" aria-selected={view === 'pitch'} className={view === 'pitch' ? 'on' : ''} disabled={busy} onClick={() => setView('pitch')}>
+            Pitch
+          </button>
+        </div>
+        <BeatIndicator meter={viewMeter} bars={viewBars} playhead={playhead} live={live} />
+      </div>
+
+      {showNotes ? (
+        <>
+          <PianoRoll
+            notes={notes}
+            octave={octave}
+            meter={viewMeter}
+            bars={viewBars}
+            grid={grid}
+            frames={frames}
+            selectedId={selected}
+            onSelect={setSelected}
+            playhead={playhead}
+            live={live}
+          />
+          <NotesToolbar
+            grid={settings.grid}
+            onGrid={changeGrid}
+            octave={octave}
+            onOctave={setOctave}
+            onFit={() => setOctave(fitOctave(notes))}
+            hasSelection={selected !== null}
+            onEdit={edit}
+            disabled={busy}
+          />
+        </>
+      ) : view === 'notes' && !recording ? (
+        <div className="empty">
+          <p>Hit <strong>Record</strong>, wait for the count-in, then hum your riff.</p>
+          <p className="hint">The notes show up here, ready to fix and play back.</p>
+        </div>
+      ) : (
+        <PitchView frames={frames} meter={viewMeter} bars={viewBars} playhead={playhead} live={live} version={version} />
+      )}
 
       {error && (
         <p className="error" role="alert">
@@ -227,29 +239,21 @@ export function App() {
       )}
 
       <footer className="transport">
-        <button
-          className="secondary"
-          disabled={!take || mode === 'recording' || mode === 'starting'}
-          onClick={mode === 'playing' ? stop : play}
-        >
-          {mode === 'playing' ? '■ Stop' : '▶ Play take'}
+        <button className="secondary" disabled={!take || recording} onClick={mode === 'playing' ? stop : play}>
+          {mode === 'playing' ? '■ Stop' : view === 'pitch' ? '▶ Play take' : '▶ Play notes'}
         </button>
         <button
-          className={`record ${mode === 'recording' || mode === 'starting' ? 'active' : ''}`}
+          className={`record ${recording ? 'active' : ''}`}
           disabled={mode === 'playing' || mode === 'starting'}
           onClick={mode === 'recording' ? stop : record}
           aria-label={mode === 'recording' ? 'Stop recording' : 'Record'}
         >
           <span className="record-icon" />
-          {mode === 'recording' ? 'Stop' : 'Record'}
+          {mode === 'recording' ? 'Stop' : take ? 'New take' : 'Record'}
         </button>
       </footer>
     </div>
   );
-}
-
-function clampBpm(v: number) {
-  return Math.max(30, Math.min(300, Math.round(v)));
 }
 
 function describeError(e: unknown): string {
