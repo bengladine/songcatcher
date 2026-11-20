@@ -132,6 +132,7 @@ export function SettingsPanel({ settings, update, busy, open, onToggle, lastLate
             Notes landing late on the grid → raise latency; early → lower it.
             {lastLatency !== null ? ` Last take: ${Math.round(lastLatency * 1000)} ms total.` : ''}
           </p>
+          <p className="hint build">Build {__BUILD__}</p>
         </>
       )}
     </section>

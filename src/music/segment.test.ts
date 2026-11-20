@@ -93,3 +93,59 @@ describe('segmentNotes', () => {
     expect(notes.map((n) => n.pitch)).toEqual([45]);
   });
 });
+
+/** Frames from a pitch function of time (seconds), for slides and wobble. */
+function contour(seconds: number, pitchAt: (t: number) => number | null, rmsAt: (t: number) => number = () => 0.2) {
+  const frames: TrackFrame[] = [];
+  for (let t = 0; t < seconds - 1e-9; t += HOP) {
+    const m = pitchAt(t);
+    frames.push({ t, freq: m === null ? null : midiToFreq(m), rms: m === null ? 0.001 : rmsAt(t) });
+  }
+  return frames;
+}
+
+// Deterministic pseudo-random jitter.
+const jitter = (t: number) => 0.25 * Math.sin(t * 47) + 0.15 * Math.sin(t * 131 + 1);
+
+describe('segmentNotes with a real voice', () => {
+  it('keeps a held note whole through a wobble (screenshot: B3 split in two)', () => {
+    const notes = segmentNotes(contour(0.7, (t) => 59 + jitter(t) + (t > 0.3 && t < 0.39 ? 0.9 : 0)));
+    expect(notes.map((n) => n.pitch)).toEqual([59]);
+    expect(notes[0].end - notes[0].start).toBeGreaterThan(0.65);
+  });
+
+  it('merges a slide up into the note it lands on (screenshot: short A3 + A3)', () => {
+    const notes = segmentNotes(contour(0.5, (t) => (t < 0.08 ? 55 + (t / 0.08) * 2 : 57) + jitter(t) * 0.5));
+    expect(notes.map((n) => n.pitch)).toEqual([57]);
+    expect(notes[0].start).toBeCloseTo(0, 2);
+  });
+
+  it('merges a fall-off at the end into the note', () => {
+    const notes = segmentNotes(contour(0.5, (t) => (t < 0.4 ? 55 : 55 - ((t - 0.4) / 0.1) * 3)));
+    expect(notes.map((n) => n.pitch)).toEqual([55]);
+    expect(notes[0].end).toBeGreaterThan(0.45);
+  });
+
+  it('merges the drop from one note into the next (screenshot: short G#3 before G3)', () => {
+    const notes = segmentNotes(
+      contour(0.9, (t) => (t < 0.3 ? 57 : t < 0.38 ? 57 - ((t - 0.3) / 0.08) * 2 : 55) + jitter(t) * 0.5),
+    );
+    expect(notes.map((n) => n.pitch)).toEqual([57, 55]);
+  });
+
+  it('still separates fast real notes', () => {
+    const notes = segmentNotes(contour(0.45, (t) => (t < 0.15 ? 50 : t < 0.3 ? 52 : 53)));
+    expect(notes.map((n) => n.pitch)).toEqual([50, 52, 53]);
+  });
+
+  it('still separates a re-sung note even right after a slide', () => {
+    const notes = segmentNotes(
+      contour(
+        0.8,
+        (t) => (t < 0.06 ? 50 + (t / 0.06) * 2 : 52),
+        (t) => (t > 0.38 && t < 0.42 ? 0.02 : 0.3),
+      ),
+    );
+    expect(notes.map((n) => n.pitch)).toEqual([52, 52]);
+  });
+});

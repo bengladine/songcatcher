@@ -23,6 +23,12 @@ export interface RawNote {
 export interface SegmentOptions {
   /** Shorter notes are discarded (blips, consonants, octave glitches). */
   minNoteDuration: number;
+  /**
+   * Pieces shorter than this that run straight into a neighbouring note within ±maxGlide
+   * semitones are treated as a slide into / out of that note (scoops, fall-offs) and merged.
+   */
+  glideDuration: number;
+  maxGlide: number;
   /** A sustained move by more than this many semitones from the note's pitch starts a new note. */
   splitSemitones: number;
   /** …sustained for at least this long (seconds). Shorter excursions are treated as wobble. */
@@ -41,8 +47,10 @@ export interface SegmentOptions {
 
 export const DEFAULT_SEGMENT_OPTIONS: SegmentOptions = {
   minNoteDuration: 0.07,
+  glideDuration: 0.12,
+  maxGlide: 3,
   splitSemitones: 0.6,
-  splitHold: 0.03,
+  splitHold: 0.06,
   maxGap: 0.04,
   maxGatedGap: 0.16,
   onsetDb: 6,
@@ -62,7 +70,9 @@ const toDb = (x: number) => 20 * Math.log10(Math.max(x, 1e-9));
  *    note's median; a deviation held for splitHold starts a new note (vibrato/scoops don't).
  *    Short unvoiced gaps are bridged, longer ones end the note.
  * 4. Inside each note, a deep RMS valley = the same pitch re-sung ("da-da-da") → split there.
- * 5. Drop notes shorter than minNoteDuration; round pitch to the nearest semitone.
+ * 5. Clean up what a real voice does between notes (see tidyNotes): slides into and out of
+ *    notes join the note they lead to, a held note broken up by a wobble is glued back
+ *    together, then leftovers shorter than minNoteDuration are dropped.
  */
 export function segmentNotes(
   frames: readonly TrackFrame[],
@@ -82,7 +92,7 @@ export function segmentNotes(
   const midi = medianFilter(raw, o.medianFrames);
 
   // --- 3. pitch-continuity segmentation -------------------------------------------------------
-  type Seg = { i0: number; i1: number; pitches: number[] };
+  type Seg = { i0: number; i1: number; pitches: number[]; onset: Onset };
   const segs: Seg[] = [];
   let cur: Seg | null = null;
   let unvoicedTime = 0; // non-gated unvoiced time since last voiced frame
@@ -91,8 +101,10 @@ export function segmentNotes(
   let devPitches: number[] = [];
   const holdFrames = Math.max(1, Math.round(o.splitHold / hop));
 
+  let lastVoiced = -1;
   const close = () => {
-    if (cur) segs.push(cur);
+    // Frames still sliding when the note ends (a fall-off) count towards its length, not pitch.
+    if (cur) segs.push({ ...cur, i1: Math.max(cur.i1, lastVoiced) });
     cur = null;
     devStart = -1;
     devPitches = [];
@@ -109,8 +121,9 @@ export function segmentNotes(
     }
     unvoicedTime = 0;
     gatedTime = 0;
+    lastVoiced = i;
     if (!cur) {
-      cur = { i0: i, i1: i, pitches: [m] };
+      cur = { i0: i, i1: i, pitches: [m], onset: 'gap' };
       continue;
     }
     const ref = median(cur.pitches);
@@ -121,9 +134,10 @@ export function segmentNotes(
       }
       devPitches.push(m);
       if (devPitches.length >= holdFrames) {
-        const next: Seg = { i0: devStart, i1: i, pitches: devPitches };
-        // The old note ends at its last in-tune frame before the deviation.
-        if (cur.i1 >= cur.i0) segs.push(cur);
+        const next: Seg = { i0: devStart, i1: i, pitches: devPitches, onset: 'pitch' };
+        // Legato: the old note lasts until the new one starts (the slide between them
+        // belongs to the old note's length, not its pitch).
+        segs.push({ ...cur, i1: devStart - 1 });
         cur = next;
         devStart = -1;
         devPitches = [];
@@ -138,7 +152,7 @@ export function segmentNotes(
   close();
 
   // --- 4. energy re-articulation splits -------------------------------------------------------
-  const out: RawNote[] = [];
+  const out: Piece[] = [];
   const valleyWin = 3;
   const peakWin = Math.max(4, Math.round(0.1 / hop));
   const minFrames = Math.max(1, Math.round(o.minNoteDuration / hop));
@@ -164,6 +178,7 @@ export function segmentNotes(
     }
     cuts.push(s.i1 + 1);
     for (let c = 0; c + 1 < cuts.length; c++) {
+      const onset: Onset = c === 0 ? s.onset : 'energy';
       const a = cuts[c];
       const b = cuts[c + 1] - 1;
       const ps: number[] = [];
@@ -174,12 +189,76 @@ export function segmentNotes(
       if (!ps.length) continue;
       const start = frames[a].t;
       const end = frames[b].t + hop;
-      if (end - start < o.minNoteDuration) continue;
-      const rawPitch = median(ps);
-      out.push({ pitch: Math.round(rawPitch), rawPitch, start, end });
+      out.push({ rawPitch: median(ps), start, end, onset });
     }
   }
-  return out;
+  return tidyNotes(out, hop, o).map(({ rawPitch, start, end }) => ({
+    pitch: Math.round(rawPitch),
+    rawPitch,
+    start,
+    end,
+  }));
+}
+
+/** Why a piece started: after silence, on a pitch change, or on a level re-attack. */
+type Onset = 'gap' | 'pitch' | 'energy';
+interface Piece {
+  rawPitch: number;
+  start: number;
+  end: number;
+  onset: Onset;
+}
+
+/**
+ * Voices don't jump cleanly between notes: they slide in from below, wobble, and fall off at
+ * the end. Pitch segmentation turns each of those into a short extra piece. Repair:
+ *  - a short piece glued to a longer, nearby-pitched neighbour is a slide → merge into it
+ *    (prefer the following note: scoops into a note are more common than fall-offs);
+ *  - two touching pieces at the same pitch split only by a pitch excursion → one note
+ *    (re-attacks after an energy dip or silence stay separate: those are re-sung notes);
+ *  - anything still shorter than minNoteDuration is dropped.
+ */
+function tidyNotes(pieces: Piece[], hop: number, o: SegmentOptions): Piece[] {
+  const ps = pieces.map((p) => ({ ...p }));
+  const dur = (p: Piece) => p.end - p.start;
+  const touching = (a: Piece, b: Piece) => b.start - a.end <= o.maxGap + 1.5 * hop;
+  const near = (a: Piece, b: Piece) => Math.abs(a.rawPitch - b.rawPitch) <= o.maxGlide;
+
+  let changed = true;
+  while (changed) {
+    changed = false;
+    // Shortest first, so a wobble between two halves of a note is absorbed before the halves
+    // are compared.
+    const order = ps.map((_, i) => i).sort((a, b) => dur(ps[a]) - dur(ps[b]));
+    for (const i of order) {
+      const p = ps[i];
+      if (dur(p) >= o.glideDuration) break;
+      const next = ps[i + 1];
+      const prev = ps[i - 1];
+      if (next && next.onset !== 'energy' && touching(p, next) && near(p, next) && dur(next) >= dur(p)) {
+        next.start = p.start;
+        next.onset = p.onset;
+      } else if (prev && p.onset !== 'energy' && touching(prev, p) && near(prev, p) && dur(prev) >= dur(p)) {
+        prev.end = p.end;
+      } else continue;
+      ps.splice(i, 1);
+      changed = true;
+      break;
+    }
+    if (changed) continue;
+    for (let i = 0; i + 1 < ps.length; i++) {
+      const a = ps[i];
+      const b = ps[i + 1];
+      if (b.onset === 'pitch' && touching(a, b) && Math.abs(a.rawPitch - b.rawPitch) < 0.5) {
+        a.rawPitch = (a.rawPitch * dur(a) + b.rawPitch * dur(b)) / (dur(a) + dur(b));
+        a.end = b.end;
+        ps.splice(i + 1, 1);
+        changed = true;
+        break;
+      }
+    }
+  }
+  return ps.filter((p) => dur(p) >= o.minNoteDuration);
 }
 
 function maxOf(f: (i: number) => number, a: number, b: number): number {

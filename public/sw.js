@@ -1,6 +1,6 @@
 // Minimal offline support: network-first for pages (so updates show up), cache-first for
 // hashed assets. Bump VERSION to drop old caches.
-const VERSION = 'v1';
+const VERSION = 'v2';
 const CACHE = `songcatcher-${VERSION}`;
 
 self.addEventListener('install', (e) => {
@@ -23,7 +23,9 @@ self.addEventListener('fetch', (e) => {
 
   if (req.mode === 'navigate') {
     e.respondWith(
-      fetch(req)
+      // no-cache: GitHub Pages lets browsers cache HTML for 10 min; always revalidate so a new
+      // deploy shows up on the next open.
+      fetch(req, { cache: 'no-cache' })
         .then((res) => {
           const copy = res.clone();
           caches.open(CACHE).then((c) => c.put('./', copy));

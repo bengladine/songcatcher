@@ -520,3 +520,8 @@ button:disabled {
   color: var(--on-text);
   border-color: var(--on);
 }
+
+.hint.build {
+  font-size: 11px;
+  opacity: 0.7;
+}
